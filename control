@@ -1,0 +1,9 @@
+Package: com.jiuyue.mediafloater
+Name: 悬浮播放控制
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: 悬浮音乐窗插件
+Maintainer: 旧约
+Author: 旧约
+Section: Tweaks
+Depends: firmware (>= 14.0)
