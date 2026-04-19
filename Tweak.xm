@@ -31,6 +31,8 @@ static void playImpactFeedback(void) {
 // ========== 音量控制视图（水位直角，容器裁剪圆角，阴影可见） ==========
 @interface MediaFloaterVolumeView : UIView
 @property (nonatomic, assign) CGFloat currentVolume;
+- (void)setLevel:(CGFloat)level animated:(BOOL)animated;
+- (void)setSymbolName:(NSString *)symbolName;
 - (void)setVolume:(CGFloat)volume animated:(BOOL)animated;
 - (CGFloat)waterLevelY;
 @end
@@ -104,6 +106,15 @@ static void playImpactFeedback(void) {
     }
 }
 
+- (void)setLevel:(CGFloat)level animated:(BOOL)animated {
+    [self updateFillHeight:level animated:animated];
+}
+
+- (void)setSymbolName:(NSString *)symbolName {
+    UIImage *image = [UIImage systemImageNamed:symbolName ?: @"speaker.wave.2.fill"];
+    _iconView.image = [image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+}
+
 - (void)setVolume:(CGFloat)volume animated:(BOOL)animated {
     AVSystemController *av = [NSClassFromString(@"AVSystemController") sharedAVSystemController];
     [av setVolumeTo:volume forCategory:@"Audio/Video"];
@@ -117,20 +128,26 @@ static void playImpactFeedback(void) {
 @property (nonatomic, weak) UIWindow *targetWindow;
 @property (nonatomic, strong) MediaFloaterVolumeView *volumeView;
 @property (nonatomic, assign) BOOL isVolumeMode;
+@property (nonatomic, assign) BOOL isSpeedMode;
 @property (nonatomic, assign) CGFloat initialVolume;
 @property (nonatomic, assign) CGFloat initialFingerY;
+@property (nonatomic, assign) CGFloat initialRotationDuration;
 - (void)handleTap:(UITapGestureRecognizer *)tap;
 - (void)handleDoubleTap:(UITapGestureRecognizer *)tap;
 - (void)handleLongPress:(UILongPressGestureRecognizer *)longPress;
 - (void)handlePan:(UIPanGestureRecognizer *)pan;
+- (void)activateVolumeMode;
+- (void)activateRotationSpeedMode;
+- (void)deactivateVerticalControlMode;
 @end
 
 // ========== 函数前向声明 ==========
 static void updateUIWithNowPlayingInfo(void);
-static void updateUIWithNowPlayingInfoDictionary(NSDictionary *info);
+static void updateUIWithNowPlayingInfoDictionary(NSDictionary *info, BOOL isPlaying);
 static NSString *trackIdentifierFromNowPlayingInfo(NSDictionary *info);
 static UIImage *coverImageFromNowPlayingInfo(NSDictionary *info);
 static void applyAlbumArtImage(UIImage *cover, BOOL animated);
+static void resetAlbumArtRotationState(void);
 static void updateAlbumArtRotation(BOOL isPlaying);
 static void scheduleArtworkRetry(void);
 static CGRect constrainFrameToScreen(CGRect frame);
@@ -150,7 +167,14 @@ static const CGFloat kWindowSize = 55.0;
 static const NSTimeInterval kArtworkRetryInterval = 0.22;
 static const NSInteger kArtworkRetryMaxAttempts = 6;
 static NSString * const kAlbumArtRotationAnimationKey = @"MediaFloaterAlbumArtRotation";
+static NSString * const kMediaFloaterDefaultsSuiteName = @"com.axs.mediafloater";
+static NSString * const kRotationDurationDefaultsKey = @"RotationDuration";
+static const CGFloat kRotationDurationDefault = 12.0;
+static const CGFloat kRotationDurationMin = 4.0;
+static const CGFloat kRotationDurationMax = 20.0;
 static CGPoint currentOrigin = {20, 100};
+static CGFloat currentRotationDuration = kRotationDurationDefault;
+static BOOL currentPlaybackIsPlaying = NO;
 
 static NSString *currentTrackIdentifier = nil;
 static NSInteger artworkRetryToken = 0;
@@ -168,6 +192,15 @@ static BOOL wasPlayingInfoAvailable = NO;
 static BOOL userSuppressedAutoShow = NO;
 static BOOL floatWindowRetryScheduled = NO;
 
+static CGFloat clampRotationDuration(CGFloat duration) {
+    return MAX(kRotationDurationMin, MIN(kRotationDurationMax, duration));
+}
+
+static CGFloat rotationDurationProgress(CGFloat duration) {
+    CGFloat clampedDuration = clampRotationDuration(duration);
+    return (kRotationDurationMax - clampedDuration) / (kRotationDurationMax - kRotationDurationMin);
+}
+
 static CGRect constrainFrameToScreen(CGRect frame) {
     CGRect screen = [UIScreen mainScreen].bounds;
     if (frame.origin.x + kWindowSize > screen.size.width) frame.origin.x = screen.size.width - kWindowSize;
@@ -178,14 +211,14 @@ static CGRect constrainFrameToScreen(CGRect frame) {
 }
 
 static void saveCurrentOrigin(void) {
-    NSUserDefaults *def = [[NSUserDefaults alloc] initWithSuiteName:@"com.jiuyue.mediafloater"];
+    NSUserDefaults *def = [[NSUserDefaults alloc] initWithSuiteName:kMediaFloaterDefaultsSuiteName];
     [def setFloat:currentOrigin.x forKey:@"FloatOriginX"];
     [def setFloat:currentOrigin.y forKey:@"FloatOriginY"];
     [def synchronize];
 }
 
 static void loadCurrentOrigin(void) {
-    NSUserDefaults *def = [[NSUserDefaults alloc] initWithSuiteName:@"com.jiuyue.mediafloater"];
+    NSUserDefaults *def = [[NSUserDefaults alloc] initWithSuiteName:kMediaFloaterDefaultsSuiteName];
     NSNumber *x = [def objectForKey:@"FloatOriginX"];
     NSNumber *y = [def objectForKey:@"FloatOriginY"];
     if (x && y) {
@@ -194,6 +227,22 @@ static void loadCurrentOrigin(void) {
     CGRect frame = CGRectMake(currentOrigin.x, currentOrigin.y, kWindowSize, kWindowSize);
     frame = constrainFrameToScreen(frame);
     currentOrigin = frame.origin;
+}
+
+static void saveRotationDuration(void) {
+    NSUserDefaults *def = [[NSUserDefaults alloc] initWithSuiteName:kMediaFloaterDefaultsSuiteName];
+    [def setFloat:currentRotationDuration forKey:kRotationDurationDefaultsKey];
+    [def synchronize];
+}
+
+static void loadRotationDuration(void) {
+    NSUserDefaults *def = [[NSUserDefaults alloc] initWithSuiteName:kMediaFloaterDefaultsSuiteName];
+    id storedValue = [def objectForKey:kRotationDurationDefaultsKey];
+    if (storedValue) {
+        currentRotationDuration = clampRotationDuration([def floatForKey:kRotationDurationDefaultsKey]);
+    } else {
+        currentRotationDuration = kRotationDurationDefault;
+    }
 }
 
 static NSString* safeStringFromObject(id obj) {
@@ -345,15 +394,30 @@ static void applyAlbumArtImage(UIImage *cover, BOOL animated) {
     }
 }
 
+static void resetAlbumArtRotationState(void) {
+    if (!albumArtView) return;
+
+    CALayer *layer = albumArtView.layer;
+    [layer removeAnimationForKey:kAlbumArtRotationAnimationKey];
+    layer.speed = 1.0;
+    layer.timeOffset = 0.0;
+    layer.beginTime = 0.0;
+}
+
 static void updateAlbumArtRotation(BOOL isPlaying) {
     if (!albumArtView) return;
 
     CALayer *layer = albumArtView.layer;
+    CGFloat speedFactor = kRotationDurationDefault / currentRotationDuration;
     if (![layer animationForKey:kAlbumArtRotationAnimationKey]) {
+        layer.speed = speedFactor;
+        layer.timeOffset = 0.0;
+        layer.beginTime = 0.0;
+
         CABasicAnimation *rotation = [CABasicAnimation animationWithKeyPath:@"transform.rotation.z"];
         rotation.fromValue = @(0.0);
         rotation.toValue = @(M_PI * 2.0);
-        rotation.duration = 12.0;
+        rotation.duration = kRotationDurationDefault;
         rotation.repeatCount = HUGE_VALF;
         rotation.removedOnCompletion = NO;
         rotation.fillMode = kCAFillModeForwards;
@@ -363,11 +427,13 @@ static void updateAlbumArtRotation(BOOL isPlaying) {
     if (isPlaying) {
         if (layer.speed == 0.0) {
             CFTimeInterval pausedTime = layer.timeOffset;
-            layer.speed = 1.0;
+            layer.speed = speedFactor;
             layer.timeOffset = 0.0;
             layer.beginTime = 0.0;
             CFTimeInterval timeSincePause = [layer convertTime:CACurrentMediaTime() fromLayer:nil] - pausedTime;
             layer.beginTime = timeSincePause;
+        } else {
+            layer.speed = speedFactor;
         }
     } else if (layer.speed != 0.0) {
         CFTimeInterval pausedTime = [layer convertTime:CACurrentMediaTime() fromLayer:nil];
@@ -390,9 +456,11 @@ static void scheduleArtworkRetry(void) {
     });
 }
 
-static void updateUIWithNowPlayingInfoDictionary(NSDictionary *info) {
+static void updateUIWithNowPlayingInfoDictionary(NSDictionary *info, BOOL isPlaying) {
     ensureFloatWindowReady();
     if (!albumArtView || !floatWindow) return;
+
+    currentPlaybackIsPlaying = isPlaying;
 
     BOOL hasInfo = [info isKindOfClass:[NSDictionary class]] && info.count > 0;
     if (!hasInfo) {
@@ -422,8 +490,6 @@ static void updateUIWithNowPlayingInfoDictionary(NSDictionary *info) {
         artworkRetryScheduled = NO;
     }
 
-    NSNumber *playbackRate = info[MPNowPlayingInfoPropertyPlaybackRate] ?: info[@"kMRMediaRemoteNowPlayingInfoPlaybackRate"];
-    BOOL isPlaying = [playbackRate floatValue] > 0.0f;
     UIImage *cover = coverImageFromNowPlayingInfo(info);
 
     if (cover) {
@@ -440,6 +506,9 @@ static void updateUIWithNowPlayingInfoDictionary(NSDictionary *info) {
     }
 
     if (cover) {
+        if (trackChanged) {
+            resetAlbumArtRotationState();
+        }
         applyAlbumArtImage(cover, trackChanged || !albumArtView.image);
     } else if (!albumArtView.image) {
         applyAlbumArtImage(nil, NO);
@@ -460,7 +529,9 @@ static void updateUIWithNowPlayingInfo(void) {
 
     MRMediaRemoteGetNowPlayingInfo(dispatch_get_main_queue(), ^(CFDictionaryRef information) {
         NSDictionary *info = information ? (__bridge NSDictionary *)information : nil;
-        updateUIWithNowPlayingInfoDictionary(info);
+        MRMediaRemoteGetNowPlayingApplicationIsPlaying(dispatch_get_main_queue(), ^(Boolean isPlayingNow) {
+            updateUIWithNowPlayingInfoDictionary(info, (BOOL)isPlayingNow);
+        });
     });
 }
 
@@ -477,13 +548,13 @@ static void updateUIWithNowPlayingInfo(void) {
 @implementation MediaFloaterGestureHandler
 
 - (void)handleTap:(UITapGestureRecognizer *)tap {
-    if (self.isVolumeMode) return;
+    if (self.isVolumeMode || self.isSpeedMode) return;
     playClickSound();
     MRMediaRemoteSendCommand(MRMediaRemoteCommandTogglePlayPause, nil);
 }
 
 - (void)handleDoubleTap:(UITapGestureRecognizer *)tap {
-    if (self.isVolumeMode) return;
+    if (self.isVolumeMode || self.isSpeedMode) return;
     floatWindow.hidden = YES;
     wasPlayingInfoAvailable = NO;
     userSuppressedAutoShow = YES;
@@ -491,7 +562,7 @@ static void updateUIWithNowPlayingInfo(void) {
 }
 
 - (void)handleLongPress:(UILongPressGestureRecognizer *)longPress {
-    if (self.isVolumeMode) return;
+    if (self.isVolumeMode || self.isSpeedMode) return;
 
     UIWindow *window = self.targetWindow;
     if (!window) window = longPress.view.window;
@@ -559,6 +630,14 @@ static void updateUIWithNowPlayingInfo(void) {
             return;
         }
 
+        if (self.isSpeedMode && self.volumeView) {
+            CGFloat fingerDeltaY = currentLocation.y - self.initialFingerY;
+            CGFloat newDuration = self.initialRotationDuration + (fingerDeltaY / 20.0);
+            currentRotationDuration = clampRotationDuration(newDuration);
+            [self.volumeView setLevel:rotationDurationProgress(currentRotationDuration) animated:YES];
+            return;
+        }
+
         if (!hasTriggeredControl) {
             CGFloat absDeltaX = fabs(deltaX);
             CGFloat absDeltaY = fabs(deltaY);
@@ -566,11 +645,19 @@ static void updateUIWithNowPlayingInfo(void) {
             if (absDeltaY > absDeltaX && absDeltaY > 24.0) {
                 hasTriggeredControl = YES;
                 playImpactFeedback();
-                [self activateVolumeMode];
-                CGFloat fingerDeltaY = currentLocation.y - self.initialFingerY;
-                CGFloat newVol = self.initialVolume - (fingerDeltaY / 200.0);
-                newVol = MAX(0.0, MIN(1.0, newVol));
-                [self.volumeView setVolume:newVol animated:NO];
+                if (deltaY < 0) {
+                    [self activateVolumeMode];
+                    CGFloat fingerDeltaY = currentLocation.y - self.initialFingerY;
+                    CGFloat newVol = self.initialVolume - (fingerDeltaY / 200.0);
+                    newVol = MAX(0.0, MIN(1.0, newVol));
+                    [self.volumeView setVolume:newVol animated:NO];
+                } else {
+                    [self activateRotationSpeedMode];
+                    CGFloat fingerDeltaY = currentLocation.y - self.initialFingerY;
+                    CGFloat newDuration = self.initialRotationDuration + (fingerDeltaY / 20.0);
+                    currentRotationDuration = clampRotationDuration(newDuration);
+                    [self.volumeView setLevel:rotationDurationProgress(currentRotationDuration) animated:NO];
+                }
                 return;
             }
 
@@ -588,8 +675,11 @@ static void updateUIWithNowPlayingInfo(void) {
     } else if (pan.state == UIGestureRecognizerStateEnded || pan.state == UIGestureRecognizerStateCancelled) {
         BOOL didFinishMove = didMoveWindowDuringPan || isLongPressActive;
 
-        if (self.isVolumeMode) {
-            [self deactivateVolumeMode];
+        if (self.isVolumeMode || self.isSpeedMode) {
+            if (self.isSpeedMode) {
+                saveRotationDuration();
+            }
+            [self deactivateVerticalControlMode];
             [UIView animateWithDuration:0.25 animations:^{
                 window.frame = CGRectMake(currentOrigin.x, currentOrigin.y, kWindowSize, kWindowSize);
             }];
@@ -618,7 +708,7 @@ static void updateUIWithNowPlayingInfo(void) {
 }
 
 - (void)activateVolumeMode {
-    if (self.isVolumeMode) return;
+    if (self.isVolumeMode || self.isSpeedMode) return;
     self.isVolumeMode = YES;
 
     UIWindow *window = self.targetWindow;
@@ -629,6 +719,7 @@ static void updateUIWithNowPlayingInfo(void) {
     self.volumeView = [[MediaFloaterVolumeView alloc] initWithFrame:volumeFrame];
     self.volumeView.alpha = 0;
     self.volumeView.transform = CGAffineTransformMakeScale(0.8, 0.8);
+    [self.volumeView setSymbolName:@"speaker.wave.2.fill"];
     [contentView addSubview:self.volumeView];
 
     self.volumeView.center = panStartLocationInWindow;
@@ -641,22 +732,45 @@ static void updateUIWithNowPlayingInfo(void) {
     self.initialFingerY = panStartLocation.y;
 
     [UIView animateWithDuration:0.25 animations:^{
-        albumArtView.alpha = 0;
-        albumArtView.transform = CGAffineTransformMakeScale(0.8, 0.8);
         self.volumeView.alpha = 1;
         self.volumeView.transform = CGAffineTransformIdentity;
     }];
 }
 
-- (void)deactivateVolumeMode {
-    if (!self.isVolumeMode) return;
+- (void)activateRotationSpeedMode {
+    if (self.isVolumeMode || self.isSpeedMode) return;
+    self.isSpeedMode = YES;
+
+    UIWindow *window = self.targetWindow;
+    if (!window) return;
+
+    UIView *contentView = window.rootViewController.view ?: window;
+    CGRect controlFrame = CGRectMake(0, 0, kWindowSize, 150);
+    self.volumeView = [[MediaFloaterVolumeView alloc] initWithFrame:controlFrame];
+    self.volumeView.alpha = 0;
+    self.volumeView.transform = CGAffineTransformMakeScale(0.8, 0.8);
+    [self.volumeView setSymbolName:@"dial.medium.fill"];
+    [self.volumeView setLevel:rotationDurationProgress(currentRotationDuration) animated:NO];
+    [contentView addSubview:self.volumeView];
+
+    self.volumeView.center = panStartLocationInWindow;
+    self.initialFingerY = panStartLocation.y;
+    self.initialRotationDuration = currentRotationDuration;
+
+    [UIView animateWithDuration:0.25 animations:^{
+        self.volumeView.alpha = 1;
+        self.volumeView.transform = CGAffineTransformIdentity;
+    }];
+}
+
+- (void)deactivateVerticalControlMode {
+    if (!self.isVolumeMode && !self.isSpeedMode) return;
     self.isVolumeMode = NO;
+    self.isSpeedMode = NO;
 
     [UIView animateWithDuration:0.25 animations:^{
         self.volumeView.alpha = 0;
         self.volumeView.transform = CGAffineTransformMakeScale(0.8, 0.8);
-        albumArtView.alpha = 1;
-        albumArtView.transform = CGAffineTransformIdentity;
     } completion:^(BOOL finished) {
         [self.volumeView removeFromSuperview];
         self.volumeView = nil;
@@ -665,7 +779,7 @@ static void updateUIWithNowPlayingInfo(void) {
 
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
     if ([gestureRecognizer isKindOfClass:[UITapGestureRecognizer class]]) {
-        return !isLongPressActive && !self.isVolumeMode;
+        return !isLongPressActive && !self.isVolumeMode && !self.isSpeedMode;
     }
     return YES;
 }
@@ -790,6 +904,7 @@ static void registerNowPlayingObservers(void) {
 }
 
 %ctor {
+    loadRotationDuration();
     registerLifecycleObservers();
     registerNowPlayingObservers();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
