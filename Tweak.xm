@@ -141,6 +141,7 @@ static void ensureFloatWindowReady(void);
 static UIWindowScene *findBestWindowScene(void);
 static void scheduleFloatWindowRetry(NSTimeInterval delay);
 static void registerLifecycleObservers(void);
+static void registerNowPlayingObservers(void);
 
 // ========== 悬浮窗 UI 全局变量 ==========
 static UIWindow *floatWindow = nil;
@@ -284,10 +285,10 @@ static NSString *trackIdentifierFromNowPlayingInfo(NSDictionary *info) {
         return [persistentID description];
     }
 
-    NSString *title = safeStringFromObject(info[MPMediaItemPropertyTitle] ?: info[@"kMRMediaRemoteNowPlayingInfoTitle"]);
-    NSString *artist = safeStringFromObject(info[MPMediaItemPropertyArtist] ?: info[@"kMRMediaRemoteNowPlayingInfoArtist"]);
-    NSString *album = safeStringFromObject(info[MPMediaItemPropertyAlbumTitle] ?: info[@"kMRMediaRemoteNowPlayingInfoAlbum"]);
-    NSNumber *duration = info[MPMediaItemPropertyPlaybackDuration] ?: info[@"kMRMediaRemoteNowPlayingInfoDuration"];
+    NSString *title = safeStringFromObject(info[MPMediaItemPropertyTitle] ?: info[(__bridge NSString *)kMRMediaRemoteNowPlayingInfoTitle] ?: info[@"kMRMediaRemoteNowPlayingInfoTitle"]);
+    NSString *artist = safeStringFromObject(info[MPMediaItemPropertyArtist] ?: info[(__bridge NSString *)kMRMediaRemoteNowPlayingInfoArtist] ?: info[@"kMRMediaRemoteNowPlayingInfoArtist"]);
+    NSString *album = safeStringFromObject(info[MPMediaItemPropertyAlbumTitle] ?: info[(__bridge NSString *)kMRMediaRemoteNowPlayingInfoAlbum] ?: info[@"kMRMediaRemoteNowPlayingInfoAlbum"]);
+    NSNumber *duration = info[MPMediaItemPropertyPlaybackDuration] ?: info[(__bridge NSString *)kMRMediaRemoteNowPlayingInfoDuration] ?: info[@"kMRMediaRemoteNowPlayingInfoDuration"];
 
     NSMutableArray *parts = [NSMutableArray array];
     if (title.length) [parts addObject:title];
@@ -303,7 +304,7 @@ static NSString *trackIdentifierFromNowPlayingInfo(NSDictionary *info) {
 static UIImage *coverImageFromNowPlayingInfo(NSDictionary *info) {
     if (![info isKindOfClass:[NSDictionary class]]) return nil;
 
-    NSData *artworkData = info[@"kMRMediaRemoteNowPlayingInfoArtworkData"];
+    NSData *artworkData = info[(__bridge NSString *)kMRMediaRemoteNowPlayingInfoArtworkData] ?: info[@"kMRMediaRemoteNowPlayingInfoArtworkData"];
     if ([artworkData isKindOfClass:[NSData class]] && artworkData.length > 0) {
         UIImage *rawImage = [UIImage imageWithData:artworkData];
         if (rawImage) {
@@ -440,7 +441,7 @@ static void updateUIWithNowPlayingInfoDictionary(NSDictionary *info) {
 
     if (cover) {
         applyAlbumArtImage(cover, trackChanged || !albumArtView.image);
-    } else if (trackChanged || !albumArtView.image) {
+    } else if (!albumArtView.image) {
         applyAlbumArtImage(nil, NO);
     }
 
@@ -467,7 +468,7 @@ static void updateUIWithNowPlayingInfo(void) {
 - (void)setNowPlayingInfo:(NSDictionary *)info {
     %orig;
     dispatch_async(dispatch_get_main_queue(), ^{
-        updateUIWithNowPlayingInfoDictionary(info);
+        updateUIWithNowPlayingInfo();
     });
 }
 %end
@@ -771,9 +772,28 @@ static void registerLifecycleObservers(void) {
     });
 }
 
+static void registerNowPlayingObservers(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        MRMediaRemoteRegisterForNowPlayingNotifications(dispatch_get_main_queue());
+
+        NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+        void (^refreshBlock)(NSNotification *) = ^(NSNotification *note) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                updateUIWithNowPlayingInfo();
+            });
+        };
+
+        [center addObserverForName:(__bridge NSString *)kMRMediaRemoteNowPlayingInfoDidChangeNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:refreshBlock];
+        [center addObserverForName:(__bridge NSString *)kMRMediaRemoteNowPlayingApplicationIsPlayingDidChangeNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:refreshBlock];
+    });
+}
+
 %ctor {
     registerLifecycleObservers();
+    registerNowPlayingObservers();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         ensureFloatWindowReady();
+        updateUIWithNowPlayingInfo();
     });
 }
