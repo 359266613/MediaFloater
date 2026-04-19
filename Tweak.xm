@@ -4,6 +4,7 @@
 #import <MediaPlayer/MediaPlayer.h>
 #import <MediaRemote/MediaRemote.h>
 #import <AVFoundation/AVFoundation.h>
+#import <QuartzCore/QuartzCore.h>
 
 // ========== 私有音量控制 ==========
 @interface AVSystemController : NSObject
@@ -126,6 +127,12 @@ static void playImpactFeedback(void) {
 
 // ========== 函数前向声明 ==========
 static void updateUIWithNowPlayingInfo(void);
+static void updateUIWithNowPlayingInfoDictionary(NSDictionary *info);
+static NSString *trackIdentifierFromNowPlayingInfo(NSDictionary *info);
+static UIImage *coverImageFromNowPlayingInfo(NSDictionary *info);
+static void applyAlbumArtImage(UIImage *cover, BOOL animated);
+static void updateAlbumArtRotation(BOOL isPlaying);
+static void scheduleArtworkRetry(void);
 static CGRect constrainFrameToScreen(CGRect frame);
 static void saveCurrentOrigin(void);
 static void loadCurrentOrigin(void);
@@ -139,11 +146,15 @@ static void registerLifecycleObservers(void);
 static UIWindow *floatWindow = nil;
 static UIImageView *albumArtView = nil;
 static const CGFloat kWindowSize = 55.0;
+static const NSTimeInterval kArtworkRetryInterval = 0.22;
+static const NSInteger kArtworkRetryMaxAttempts = 6;
+static NSString * const kAlbumArtRotationAnimationKey = @"MediaFloaterAlbumArtRotation";
 static CGPoint currentOrigin = {20, 100};
 
-static dispatch_source_t debounceTimer = nil;
-static NSString *currentTitle = nil;
-static NSString *currentArtist = nil;
+static NSString *currentTrackIdentifier = nil;
+static NSInteger artworkRetryToken = 0;
+static NSInteger artworkRetryAttemptsRemaining = 0;
+static BOOL artworkRetryScheduled = NO;
 
 static BOOL isLongPressActive = NO;
 static BOOL hasTriggeredControl = NO;
@@ -265,104 +276,190 @@ static void ensureFloatWindowReady(void) {
     }
 }
 
+static NSString *trackIdentifierFromNowPlayingInfo(NSDictionary *info) {
+    if (![info isKindOfClass:[NSDictionary class]]) return nil;
+
+    id persistentID = info[MPMediaItemPropertyPersistentID] ?: info[@"kMRMediaRemoteNowPlayingInfoUniqueIdentifier"];
+    if (persistentID && persistentID != (id)[NSNull null]) {
+        return [persistentID description];
+    }
+
+    NSString *title = safeStringFromObject(info[MPMediaItemPropertyTitle] ?: info[@"kMRMediaRemoteNowPlayingInfoTitle"]);
+    NSString *artist = safeStringFromObject(info[MPMediaItemPropertyArtist] ?: info[@"kMRMediaRemoteNowPlayingInfoArtist"]);
+    NSString *album = safeStringFromObject(info[MPMediaItemPropertyAlbumTitle] ?: info[@"kMRMediaRemoteNowPlayingInfoAlbum"]);
+    NSNumber *duration = info[MPMediaItemPropertyPlaybackDuration] ?: info[@"kMRMediaRemoteNowPlayingInfoDuration"];
+
+    NSMutableArray *parts = [NSMutableArray array];
+    if (title.length) [parts addObject:title];
+    if (artist.length) [parts addObject:artist];
+    if (album.length) [parts addObject:album];
+    if ([duration respondsToSelector:@selector(stringValue)]) {
+        [parts addObject:[duration stringValue]];
+    }
+
+    return parts.count ? [parts componentsJoinedByString:@"|"] : nil;
+}
+
+static UIImage *coverImageFromNowPlayingInfo(NSDictionary *info) {
+    if (![info isKindOfClass:[NSDictionary class]]) return nil;
+
+    NSData *artworkData = info[@"kMRMediaRemoteNowPlayingInfoArtworkData"];
+    if ([artworkData isKindOfClass:[NSData class]] && artworkData.length > 0) {
+        UIImage *rawImage = [UIImage imageWithData:artworkData];
+        if (rawImage) {
+            return circleImageWithSize(rawImage, kWindowSize);
+        }
+    }
+
+    id artworkObject = info[MPMediaItemPropertyArtwork];
+    if ([artworkObject isKindOfClass:[MPMediaItemArtwork class]]) {
+        UIImage *rawArtwork = nil;
+        if (@available(iOS 10.0, *)) {
+            rawArtwork = [(MPMediaItemArtwork *)artworkObject imageWithSize:CGSizeMake(kWindowSize * 2, kWindowSize * 2)];
+        }
+        if (rawArtwork) {
+            return circleImageWithSize(rawArtwork, kWindowSize);
+        }
+    }
+
+    return nil;
+}
+
+static void applyAlbumArtImage(UIImage *cover, BOOL animated) {
+    if (!albumArtView) return;
+
+    void (^changes)(void) = ^{
+        albumArtView.image = cover;
+        albumArtView.backgroundColor = cover ? [UIColor clearColor] : [UIColor blackColor];
+    };
+
+    if (animated && (albumArtView.image || cover)) {
+        [UIView transitionWithView:albumArtView
+                          duration:0.08
+                           options:UIViewAnimationOptionTransitionCrossDissolve | UIViewAnimationOptionBeginFromCurrentState
+                        animations:changes
+                        completion:nil];
+    } else {
+        changes();
+    }
+}
+
+static void updateAlbumArtRotation(BOOL isPlaying) {
+    if (!albumArtView) return;
+
+    CALayer *layer = albumArtView.layer;
+    if (![layer animationForKey:kAlbumArtRotationAnimationKey]) {
+        CABasicAnimation *rotation = [CABasicAnimation animationWithKeyPath:@"transform.rotation.z"];
+        rotation.fromValue = @(0.0);
+        rotation.toValue = @(M_PI * 2.0);
+        rotation.duration = 12.0;
+        rotation.repeatCount = HUGE_VALF;
+        rotation.removedOnCompletion = NO;
+        rotation.fillMode = kCAFillModeForwards;
+        [layer addAnimation:rotation forKey:kAlbumArtRotationAnimationKey];
+    }
+
+    if (isPlaying) {
+        if (layer.speed == 0.0) {
+            CFTimeInterval pausedTime = layer.timeOffset;
+            layer.speed = 1.0;
+            layer.timeOffset = 0.0;
+            layer.beginTime = 0.0;
+            CFTimeInterval timeSincePause = [layer convertTime:CACurrentMediaTime() fromLayer:nil] - pausedTime;
+            layer.beginTime = timeSincePause;
+        }
+    } else if (layer.speed != 0.0) {
+        CFTimeInterval pausedTime = [layer convertTime:CACurrentMediaTime() fromLayer:nil];
+        layer.speed = 0.0;
+        layer.timeOffset = pausedTime;
+    }
+}
+
+static void scheduleArtworkRetry(void) {
+    if (artworkRetryScheduled || artworkRetryAttemptsRemaining <= 0) return;
+
+    NSInteger retryToken = artworkRetryToken;
+    artworkRetryScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kArtworkRetryInterval * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        artworkRetryScheduled = NO;
+        if (retryToken != artworkRetryToken || artworkRetryAttemptsRemaining <= 0) return;
+
+        artworkRetryAttemptsRemaining -= 1;
+        updateUIWithNowPlayingInfo();
+    });
+}
+
+static void updateUIWithNowPlayingInfoDictionary(NSDictionary *info) {
+    ensureFloatWindowReady();
+    if (!albumArtView || !floatWindow) return;
+
+    BOOL hasInfo = [info isKindOfClass:[NSDictionary class]] && info.count > 0;
+    if (!hasInfo) {
+        artworkRetryToken += 1;
+        artworkRetryAttemptsRemaining = 0;
+        artworkRetryScheduled = NO;
+        currentTrackIdentifier = nil;
+
+        if (wasPlayingInfoAvailable) {
+            floatWindow.hidden = YES;
+            wasPlayingInfoAvailable = NO;
+        }
+
+        applyAlbumArtImage(nil, NO);
+        albumArtView.layer.borderWidth = 0;
+        updateAlbumArtRotation(NO);
+        userSuppressedAutoShow = NO;
+        return;
+    }
+
+    NSString *newTrackIdentifier = trackIdentifierFromNowPlayingInfo(info);
+    BOOL trackChanged = ![(newTrackIdentifier ?: @"") isEqualToString:(currentTrackIdentifier ?: @"")];
+    if (trackChanged) {
+        currentTrackIdentifier = [newTrackIdentifier copy];
+        artworkRetryToken += 1;
+        artworkRetryAttemptsRemaining = kArtworkRetryMaxAttempts;
+        artworkRetryScheduled = NO;
+    }
+
+    NSNumber *playbackRate = info[MPNowPlayingInfoPropertyPlaybackRate] ?: info[@"kMRMediaRemoteNowPlayingInfoPlaybackRate"];
+    BOOL isPlaying = [playbackRate floatValue] > 0.0f;
+    UIImage *cover = coverImageFromNowPlayingInfo(info);
+
+    if (cover) {
+        if (artworkRetryAttemptsRemaining > 0 || artworkRetryScheduled) {
+            artworkRetryToken += 1;
+        }
+        artworkRetryAttemptsRemaining = 0;
+        artworkRetryScheduled = NO;
+    }
+
+    if (!wasPlayingInfoAvailable && !userSuppressedAutoShow) {
+        floatWindow.hidden = NO;
+        wasPlayingInfoAvailable = YES;
+    }
+
+    if (cover) {
+        applyAlbumArtImage(cover, trackChanged || !albumArtView.image);
+    } else if (trackChanged || !albumArtView.image) {
+        applyAlbumArtImage(nil, NO);
+    }
+
+    albumArtView.layer.borderWidth = isPlaying ? 2.0 : 0.0;
+    albumArtView.layer.borderColor = [UIColor systemGreenColor].CGColor;
+    updateAlbumArtRotation(isPlaying);
+
+    if (!cover && artworkRetryAttemptsRemaining > 0) {
+        scheduleArtworkRetry();
+    }
+}
+
 static void updateUIWithNowPlayingInfo(void) {
     ensureFloatWindowReady();
     if (!albumArtView || !floatWindow) return;
+
     MRMediaRemoteGetNowPlayingInfo(dispatch_get_main_queue(), ^(CFDictionaryRef information) {
-        BOOL hasInfo = (information != NULL);
-        if (!hasInfo) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (wasPlayingInfoAvailable) {
-                    floatWindow.hidden = YES;
-                    wasPlayingInfoAvailable = NO;
-                }
-                albumArtView.image = nil;
-                albumArtView.backgroundColor = [UIColor blackColor];
-                albumArtView.layer.borderWidth = 0;
-                userSuppressedAutoShow = NO;
-            });
-            return;
-        }
-
-        NSDictionary *info = (__bridge NSDictionary *)information;
-        id titleObj = info[MPMediaItemPropertyTitle] ?: info[@"kMRMediaRemoteNowPlayingInfoTitle"];
-        id artistObj = info[MPMediaItemPropertyArtist] ?: info[@"kMRMediaRemoteNowPlayingInfoArtist"];
-        NSString *title = safeStringFromObject(titleObj);
-        NSString *artist = safeStringFromObject(artistObj);
-        NSNumber *playbackRate = info[MPNowPlayingInfoPropertyPlaybackRate] ?: info[@"kMRMediaRemoteNowPlayingInfoPlaybackRate"];
-        BOOL isPlaying = [playbackRate floatValue] > 0;
-
-        BOOL songChanged = NO;
-        if (title.length && artist.length) {
-            if (![title isEqualToString:currentTitle] || ![artist isEqualToString:currentArtist]) {
-                songChanged = YES;
-                currentTitle = [title copy];
-                currentArtist = [artist copy];
-            }
-        } else {
-            currentTitle = nil;
-            currentArtist = nil;
-        }
-
-        if (songChanged || !albumArtView.image) {
-            NSDictionary *capturedInfo = info;
-            NSData *artworkData = capturedInfo[@"kMRMediaRemoteNowPlayingInfoArtworkData"];
-            UIImage *cover = nil;
-            if ([artworkData isKindOfClass:[NSData class]] && artworkData.length > 0) {
-                UIImage *rawImage = [UIImage imageWithData:artworkData];
-                if (rawImage) {
-                    cover = circleImageWithSize(rawImage, kWindowSize);
-                }
-            }
-
-            if (!cover) {
-                id artworkObject = capturedInfo[MPMediaItemPropertyArtwork];
-                if ([artworkObject isKindOfClass:[MPMediaItemArtwork class]]) {
-                    UIImage *rawArtwork = nil;
-                    if (@available(iOS 10.0, *)) {
-                        rawArtwork = [(MPMediaItemArtwork *)artworkObject imageWithSize:CGSizeMake(kWindowSize * 2, kWindowSize * 2)];
-                    }
-                    if (rawArtwork) {
-                        cover = circleImageWithSize(rawArtwork, kWindowSize);
-                    }
-                }
-            }
-
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (cover) {
-                    [UIView transitionWithView:albumArtView
-                                      duration:0.12
-                                       options:UIViewAnimationOptionTransitionCrossDissolve
-                                    animations:^{
-                        albumArtView.image = cover;
-                        albumArtView.backgroundColor = [UIColor clearColor];
-                    } completion:nil];
-                } else if (!albumArtView.image) {
-                    albumArtView.image = nil;
-                    albumArtView.backgroundColor = [UIColor blackColor];
-                }
-            });
-        }
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (!hasInfo) {
-                if (wasPlayingInfoAvailable) {
-                    floatWindow.hidden = YES;
-                    wasPlayingInfoAvailable = NO;
-                }
-                userSuppressedAutoShow = NO;
-            } else {
-                if (!wasPlayingInfoAvailable && !userSuppressedAutoShow) {
-                    floatWindow.hidden = NO;
-                    wasPlayingInfoAvailable = YES;
-                }
-            }
-            if (!albumArtView.image) {
-                albumArtView.backgroundColor = [UIColor blackColor];
-            }
-            albumArtView.layer.borderWidth = isPlaying ? 2 : 0;
-            albumArtView.layer.borderColor = [UIColor systemGreenColor].CGColor;
-        });
+        NSDictionary *info = information ? (__bridge NSDictionary *)information : nil;
+        updateUIWithNowPlayingInfoDictionary(info);
     });
 }
 
@@ -370,15 +467,7 @@ static void updateUIWithNowPlayingInfo(void) {
 - (void)setNowPlayingInfo:(NSDictionary *)info {
     %orig;
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (debounceTimer) dispatch_source_cancel(debounceTimer);
-        debounceTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-        dispatch_source_set_timer(debounceTimer, dispatch_time(DISPATCH_TIME_NOW, 0.1 * NSEC_PER_SEC), DISPATCH_TIME_FOREVER, 0);
-        dispatch_source_set_event_handler(debounceTimer, ^{
-            updateUIWithNowPlayingInfo();
-            dispatch_source_cancel(debounceTimer);
-            debounceTimer = nil;
-        });
-        dispatch_resume(debounceTimer);
+        updateUIWithNowPlayingInfoDictionary(info);
     });
 }
 %end
