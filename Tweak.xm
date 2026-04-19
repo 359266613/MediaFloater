@@ -1,7 +1,4 @@
 #import <UIKit/UIKit.h>
-#import <sys/stat.h>
-#import <sys/time.h>
-#import <stdarg.h>
 #import <objc/runtime.h>
 #import <AudioToolbox/AudioServices.h>
 #import <MediaPlayer/MediaPlayer.h>
@@ -14,37 +11,6 @@
 - (BOOL)getVolume:(float *)volume forCategory:(NSString *)category;
 - (BOOL)setVolumeTo:(float)volume forCategory:(NSString *)category;
 @end
-
-// ========== 安全日志写入文件 ==========
-#define LOG_FILE_PATH "/var/jb/var/mobile/MediaFloater/debug.log"
-
-static void ensure_log_dir(void) {
-    char path[256];
-    strlcpy(path, LOG_FILE_PATH, sizeof(path));
-    char *last_slash = strrchr(path, '/');
-    if (last_slash) {
-        *last_slash = '\0';
-        mkdir(path, 0755);
-    }
-}
-
-static void safe_log(const char *format, ...) {
-    ensure_log_dir();
-    FILE *fp = fopen(LOG_FILE_PATH, "a");
-    if (!fp) return;
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    struct tm *tm = localtime(&tv.tv_sec);
-    char timebuf[64];
-    strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm);
-    fprintf(fp, "[%s.%03d] ", timebuf, (int)(tv.tv_usec / 1000));
-    va_list args;
-    va_start(args, format);
-    vfprintf(fp, format, args);
-    va_end(args);
-    fprintf(fp, "\n");
-    fclose(fp);
-}
 
 // ========== 系统音效与震动 ==========
 static void playClickSound(void) {
@@ -153,6 +119,7 @@ static void playImpactFeedback(void) {
 @property (nonatomic, assign) CGFloat initialVolume;
 @property (nonatomic, assign) CGFloat initialFingerY;
 - (void)handleTap:(UITapGestureRecognizer *)tap;
+- (void)handleDoubleTap:(UITapGestureRecognizer *)tap;
 - (void)handleLongPress:(UILongPressGestureRecognizer *)longPress;
 - (void)handlePan:(UIPanGestureRecognizer *)pan;
 @end
@@ -180,7 +147,6 @@ static NSString *currentArtist = nil;
 
 static BOOL isLongPressActive = NO;
 static BOOL hasTriggeredControl = NO;
-static BOOL shouldHideOnSwipeUp = NO;
 static BOOL didMoveWindowDuringPan = NO;
 static CGPoint panStartLocation;
 static CGPoint panStartLocationInWindow;
@@ -286,7 +252,6 @@ static void ensureFloatWindowReady(void) {
     if (floatWindow && albumArtView && floatWindow.windowScene) return;
 
     if (floatWindow && (!albumArtView || !floatWindow.windowScene)) {
-        safe_log("[MusicWidget] 检测到悬浮窗状态失效，准备重建");
         [albumArtView removeFromSuperview];
         albumArtView = nil;
         floatWindow.hidden = YES;
@@ -296,7 +261,6 @@ static void ensureFloatWindowReady(void) {
 
     createFloatWindow();
     if (!floatWindow) {
-        safe_log("[MusicWidget] 当前未找到可用 scene，稍后重试创建悬浮窗");
         scheduleFloatWindowRetry(0.8);
     }
 }
@@ -317,7 +281,6 @@ static void updateUIWithNowPlayingInfo(void) {
                 albumArtView.layer.borderWidth = 0;
                 userSuppressedAutoShow = NO;
             });
-            safe_log("[MusicWidget] 无播放信息，窗口已隐藏");
             return;
         }
 
@@ -335,7 +298,6 @@ static void updateUIWithNowPlayingInfo(void) {
                 songChanged = YES;
                 currentTitle = [title copy];
                 currentArtist = [artist copy];
-                safe_log("[MusicWidget] 检测到切歌: %s - %s", title.UTF8String, artist.UTF8String);
             }
         } else {
             currentTitle = nil;
@@ -344,33 +306,41 @@ static void updateUIWithNowPlayingInfo(void) {
 
         if (songChanged || !albumArtView.image) {
             NSDictionary *capturedInfo = info;
-            int64_t delayNano = (int64_t)((songChanged ? 0.5 : 0.0) * NSEC_PER_SEC);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delayNano), dispatch_get_main_queue(), ^{
-                NSData *artworkData = capturedInfo[@"kMRMediaRemoteNowPlayingInfoArtworkData"];
-                UIImage *cover = nil;
-                if ([artworkData isKindOfClass:[NSData class]] && artworkData.length > 0) {
-                    UIImage *rawImage = [UIImage imageWithData:artworkData];
-                    if (rawImage) {
-                        cover = circleImageWithSize(rawImage, kWindowSize);
-                    }
-                    if (cover) safe_log("[MusicWidget] 封面获取成功");
+            NSData *artworkData = capturedInfo[@"kMRMediaRemoteNowPlayingInfoArtworkData"];
+            UIImage *cover = nil;
+            if ([artworkData isKindOfClass:[NSData class]] && artworkData.length > 0) {
+                UIImage *rawImage = [UIImage imageWithData:artworkData];
+                if (rawImage) {
+                    cover = circleImageWithSize(rawImage, kWindowSize);
                 }
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    if (wasPlayingInfoAvailable) {
-                        [UIView transitionWithView:albumArtView
-                                          duration:0.2
-                                           options:UIViewAnimationOptionTransitionCrossDissolve
-                                        animations:^{
-                            if (cover) {
-                                albumArtView.image = cover;
-                                albumArtView.backgroundColor = [UIColor clearColor];
-                            } else {
-                                albumArtView.image = nil;
-                                albumArtView.backgroundColor = [UIColor blackColor];
-                            }
-                        } completion:nil];
+            }
+
+            if (!cover) {
+                id artworkObject = capturedInfo[MPMediaItemPropertyArtwork];
+                if ([artworkObject isKindOfClass:[MPMediaItemArtwork class]]) {
+                    UIImage *rawArtwork = nil;
+                    if (@available(iOS 10.0, *)) {
+                        rawArtwork = [(MPMediaItemArtwork *)artworkObject imageWithSize:CGSizeMake(kWindowSize * 2, kWindowSize * 2)];
                     }
-                });
+                    if (rawArtwork) {
+                        cover = circleImageWithSize(rawArtwork, kWindowSize);
+                    }
+                }
+            }
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (cover) {
+                    [UIView transitionWithView:albumArtView
+                                      duration:0.12
+                                       options:UIViewAnimationOptionTransitionCrossDissolve
+                                    animations:^{
+                        albumArtView.image = cover;
+                        albumArtView.backgroundColor = [UIColor clearColor];
+                    } completion:nil];
+                } else if (!albumArtView.image) {
+                    albumArtView.image = nil;
+                    albumArtView.backgroundColor = [UIColor blackColor];
+                }
             });
         }
 
@@ -393,8 +363,6 @@ static void updateUIWithNowPlayingInfo(void) {
             albumArtView.layer.borderWidth = isPlaying ? 2 : 0;
             albumArtView.layer.borderColor = [UIColor systemGreenColor].CGColor;
         });
-        safe_log("[MusicWidget] 歌名: %s, 歌手: %s, 播放中: %d, 窗口可见: %d",
-                 title.UTF8String ?: "", artist.UTF8String ?: "", isPlaying, !floatWindow.hidden);
     });
 }
 
@@ -422,17 +390,54 @@ static void updateUIWithNowPlayingInfo(void) {
     if (self.isVolumeMode) return;
     playClickSound();
     MRMediaRemoteSendCommand(MRMediaRemoteCommandTogglePlayPause, nil);
-    safe_log("[MusicWidget] 单击：播放/暂停");
+}
+
+- (void)handleDoubleTap:(UITapGestureRecognizer *)tap {
+    if (self.isVolumeMode) return;
+    floatWindow.hidden = YES;
+    wasPlayingInfoAvailable = NO;
+    userSuppressedAutoShow = YES;
+    playImpactFeedback();
 }
 
 - (void)handleLongPress:(UILongPressGestureRecognizer *)longPress {
     if (self.isVolumeMode) return;
+
+    UIWindow *window = self.targetWindow;
+    if (!window) window = longPress.view.window;
+    if (!window) return;
+
     if (longPress.state == UIGestureRecognizerStateBegan) {
         playImpactFeedback();
         isLongPressActive = YES;
-        safe_log("[MusicWidget] 长按0.3秒触发，激活纯移动模式");
-    } else if (longPress.state == UIGestureRecognizerStateEnded || longPress.state == UIGestureRecognizerStateCancelled) {
+        didMoveWindowDuringPan = NO;
+        panStartLocationInWindow = [longPress locationInView:window];
+        return;
+    }
+
+    if (longPress.state == UIGestureRecognizerStateChanged) {
+        if (!isLongPressActive) return;
+
+        CGPoint screenLocation = [longPress locationInView:nil];
+        CGRect newFrame = window.frame;
+        newFrame.origin.x = screenLocation.x - panStartLocationInWindow.x;
+        newFrame.origin.y = screenLocation.y - panStartLocationInWindow.y;
+        newFrame = constrainFrameToScreen(newFrame);
+        window.frame = newFrame;
+        didMoveWindowDuringPan = YES;
+        return;
+    }
+
+    if (longPress.state == UIGestureRecognizerStateEnded || longPress.state == UIGestureRecognizerStateCancelled) {
+        if (didMoveWindowDuringPan) {
+            CGRect newFrame = constrainFrameToScreen(window.frame);
+            window.frame = newFrame;
+            currentOrigin = newFrame.origin;
+            saveCurrentOrigin();
+        }
+
         isLongPressActive = NO;
+        didMoveWindowDuringPan = NO;
     }
 }
 
@@ -442,18 +447,18 @@ static void updateUIWithNowPlayingInfo(void) {
     if (!window) return;
 
     CGPoint currentLocation = [pan locationInView:nil];
-    CGFloat deltaX = currentLocation.x - panStartLocation.x;
-    CGFloat deltaY = currentLocation.y - panStartLocation.y;
 
     if (pan.state == UIGestureRecognizerStateBegan) {
         originalWindowFrame = window.frame;
         hasTriggeredControl = NO;
-        shouldHideOnSwipeUp = NO;
         didMoveWindowDuringPan = NO;
         panStartLocation = currentLocation;
         panStartLocationInWindow = [pan locationInView:window];
         return;
     }
+
+    CGFloat deltaX = currentLocation.x - panStartLocation.x;
+    CGFloat deltaY = currentLocation.y - panStartLocation.y;
 
     if (pan.state == UIGestureRecognizerStateChanged) {
         if (self.isVolumeMode && self.volumeView) {
@@ -464,42 +469,31 @@ static void updateUIWithNowPlayingInfo(void) {
             return;
         }
 
-        if (isLongPressActive) {
-            CGRect newFrame = originalWindowFrame;
-            newFrame.origin.x += deltaX;
-            newFrame.origin.y += deltaY;
-            window.frame = newFrame;
-            didMoveWindowDuringPan = YES;
-            return;
-        }
-
         if (!hasTriggeredControl) {
-            if (deltaY < -30 && fabs(deltaY) > fabs(deltaX)) {
+            CGFloat absDeltaX = fabs(deltaX);
+            CGFloat absDeltaY = fabs(deltaY);
+
+            if (absDeltaY > absDeltaX && absDeltaY > 24.0) {
                 hasTriggeredControl = YES;
                 playImpactFeedback();
                 [self activateVolumeMode];
+                CGFloat fingerDeltaY = currentLocation.y - self.initialFingerY;
+                CGFloat newVol = self.initialVolume - (fingerDeltaY / 200.0);
+                newVol = MAX(0.0, MIN(1.0, newVol));
+                [self.volumeView setVolume:newVol animated:NO];
                 return;
             }
 
-            if (fabs(deltaX) > 30 || fabs(deltaY) > 50) {
+            if (absDeltaX > absDeltaY && absDeltaX > 30.0) {
                 hasTriggeredControl = YES;
                 playImpactFeedback();
-
-                if (fabs(deltaY) > fabs(deltaX) && deltaY > 50) {
-                    shouldHideOnSwipeUp = YES;
-                    safe_log("[MusicWidget] 下滑距离超过50，将在松手后隐藏");
-                } else if (fabs(deltaX) > fabs(deltaY) && fabs(deltaX) > 30) {
-                    if (deltaX > 0) {
-                        MRMediaRemoteSendCommand(MRMediaRemoteCommandNextTrack, nil);
-                        safe_log("[MusicWidget] 右滑：下一首");
-                    } else {
-                        MRMediaRemoteSendCommand(MRMediaRemoteCommandPreviousTrack, nil);
-                        safe_log("[MusicWidget] 左滑：上一首");
-                    }
+                if (deltaX > 0) {
+                    MRMediaRemoteSendCommand(MRMediaRemoteCommandNextTrack, nil);
+                } else {
+                    MRMediaRemoteSendCommand(MRMediaRemoteCommandPreviousTrack, nil);
                 }
+                return;
             }
-        } else {
-            shouldHideOnSwipeUp = (fabs(deltaY) > fabs(deltaX) && deltaY > 50);
         }
     } else if (pan.state == UIGestureRecognizerStateEnded || pan.state == UIGestureRecognizerStateCancelled) {
         BOOL didFinishMove = didMoveWindowDuringPan || isLongPressActive;
@@ -510,16 +504,8 @@ static void updateUIWithNowPlayingInfo(void) {
                 window.frame = CGRectMake(currentOrigin.x, currentOrigin.y, kWindowSize, kWindowSize);
             }];
             hasTriggeredControl = NO;
-            shouldHideOnSwipeUp = NO;
             didMoveWindowDuringPan = NO;
             return;
-        }
-
-        if (shouldHideOnSwipeUp && !didFinishMove) {
-            floatWindow.hidden = YES;
-            wasPlayingInfoAvailable = NO;
-            userSuppressedAutoShow = YES;
-            safe_log("[MusicWidget] 下滑松手，隐藏悬浮窗");
         }
 
         if (didFinishMove) {
@@ -527,7 +513,6 @@ static void updateUIWithNowPlayingInfo(void) {
             window.frame = newFrame;
             currentOrigin = newFrame.origin;
             saveCurrentOrigin();
-            safe_log("[MusicWidget] 长按拖拽结束，新原点已保存");
         } else {
             CGRect targetFrame = constrainFrameToScreen(CGRectMake(currentOrigin.x, currentOrigin.y, kWindowSize, kWindowSize));
             currentOrigin = targetFrame.origin;
@@ -538,7 +523,6 @@ static void updateUIWithNowPlayingInfo(void) {
 
         isLongPressActive = NO;
         hasTriggeredControl = NO;
-        shouldHideOnSwipeUp = NO;
         didMoveWindowDuringPan = NO;
     }
 }
@@ -597,10 +581,7 @@ static void updateUIWithNowPlayingInfo(void) {
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
-    BOOL isPanAndLongPress =
-        ([gestureRecognizer isKindOfClass:[UIPanGestureRecognizer class]] && [otherGestureRecognizer isKindOfClass:[UILongPressGestureRecognizer class]]) ||
-        ([gestureRecognizer isKindOfClass:[UILongPressGestureRecognizer class]] && [otherGestureRecognizer isKindOfClass:[UIPanGestureRecognizer class]]);
-    return isPanAndLongPress;
+    return NO;
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldRequireFailureOfGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
@@ -661,7 +642,11 @@ static void createFloatWindow(void) {
     objc_setAssociatedObject(albumArtView, "gestureHandler", handler, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:handler action:@selector(handleTap:)];
+    UITapGestureRecognizer *doubleTap = [[UITapGestureRecognizer alloc] initWithTarget:handler action:@selector(handleDoubleTap:)];
+    doubleTap.numberOfTapsRequired = 2;
+    [tap requireGestureRecognizerToFail:doubleTap];
     [albumArtView addGestureRecognizer:tap];
+    [albumArtView addGestureRecognizer:doubleTap];
 
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:handler action:@selector(handlePan:)];
     [albumArtView addGestureRecognizer:pan];
@@ -673,8 +658,7 @@ static void createFloatWindow(void) {
     pan.delegate = handler;
     longPress.delegate = handler;
     tap.delegate = handler;
-
-    safe_log("[MusicWidget] 悬浮窗创建成功，scene 已绑定，手势已注册");
+    doubleTap.delegate = handler;
 }
 
 static void registerLifecycleObservers(void) {
@@ -683,7 +667,6 @@ static void registerLifecycleObservers(void) {
         NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
 
         void (^rebuildBlock)(NSNotification *) = ^(NSNotification *note) {
-            safe_log("[MusicWidget] 收到生命周期激活事件，重新检查悬浮窗");
             dispatch_async(dispatch_get_main_queue(), ^{
                 ensureFloatWindowReady();
                 updateUIWithNowPlayingInfo();
@@ -704,5 +687,4 @@ static void registerLifecycleObservers(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         ensureFloatWindowReady();
     });
-    safe_log("[MusicWidget] 插件已加载，等待播放信息...");
 }

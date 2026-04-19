@@ -1,9 +1,18 @@
 Package: com.jiuyue.mediafloater
 Name: 悬浮播放控制
-Version: 1.0.0
+Version: 5.2.0
 Architecture: iphoneos-arm64
-Description: 悬浮音乐窗插件
-Maintainer: 旧约
-Author: 旧约
+Description: 悬浮音乐窗插件，支持悬浮封面与手势快捷控制，支持iOS15~16系统。
+ * 1. 单击：播放/暂停
+ * 2. 左滑：上一首
+ * 3. 右滑：下一首
+ * 4. 上滑：音量+
+ * 5. 下滑：音量-
+ * 6. 长按：拖动位置
+ * 7. 双击：隐藏悬浮球，隐藏之后需要重启音乐app才会再次出现。
+Maintainer: 旧约 & Axs <qiaozhani000@163.com>
+Author: 旧约 & Axs <qiaozhani000@163.com>
 Section: Tweaks
 Depends: firmware (>= 14.0)
+Icon: https://axs66.github.io/pro/icon/dy.png
+SileoDepiction: https://axs66.github.io/pro/sileodepiction/awemepro/js.json
